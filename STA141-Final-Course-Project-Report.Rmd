@@ -1,0 +1,1102 @@
+---
+title: "Exploring Neural Activity Patterns: A Data Analysis of Steinmetz et al. (2019) Mouse Experiments"
+author: "Xinyi Sun"
+date: "2024-03-18"
+output: 
+  html_document:
+    code_folding: show
+---
+
+```{r setup, include=FALSE,echo=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r warning=FALSE,echo=FALSE}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tidyverse)
+library(caret) 
+library(xgboost)
+library(pROC)
+```
+
+# Abstract
+
+This project explores the classification of trial outcomes in neuroscience experiments using machine learning techniques. Data from sessions involving mice performing visual discrimination tasks were analyzed using random forest, XGBoost, and support vector machine (SVM) classifiers. The models were trained and evaluated on subsets of the data, and their performance was assessed based on accuracy, precision, recall, and F1-score metrics. Results indicate that random forest achieved the highest accuracy, precision, recall, and F1-score, outperforming XGBoost and SVM. While XGBoost and SVM showed some predictive capability, random forest demonstrated superior performance in distinguishing between trial outcomes. These findings underscore the effectiveness of random forest in classifying trial outcomes in neuroscience experiments and highlight the importance of selecting appropriate machine learning algorithms for accurate classification tasks.
+
+
+# Section 1: Introduction 
+
+This project analyzed a dataset from the Steinmetz et al. (2019) study that examined neuronal activity in 10 mice subjected to a visual discrimination task over 39 training sessions, delivered as spike training. These tasks consisted of presenting visual stimuli of varying contrasts of 0, 0.25, 0.5, and 1 on dual screens, and the mice were asked to make decisions based on the visual stimuli using a wheel controlled by their front paws. Depending on how the mice responded, they were rewarded or punished. The analysis focused on neural activity in the visual cortex, specifically looking at spike sequences recorded from stimulus onset to 0.4 seconds post-stimulus. The analysis covered 18 training sessions with four mice named Cori, Frossman, Hence, and Lederberg to gain insight into the relationship between neural responses and the visual tasks performed.
+
+In this project, we will using neuronal activity dataset of 10 mice to studied the complex decision-making processes in the brain. The main goal is to predict the results of various tests using XGBoost, Random Forest and Support Vector Machine (SVM) to predict the models. These models not only predict the results  accurately but also reveal the cognitive processes involved in information processing and decision making.
+
+
+
+## Data structure 
+
+---
+
+A total of 18 RDS files are provided that contain the records from 18 sessions. In each RDS file, you can find the name of mouse from `mouse_name` and date of the experiment from `date_exp`. 
+
+```{r}
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./sessions/session',i,'.rds',sep=''))
+  print(session[[i]]$mouse_name)
+  print(session[[i]]$date_exp)
+}
+```
+-  What's in a session?  
+```{r,echo=FALSE}
+names(session[[1]])
+```
+-  What's in a trail?
+```{r,echo=FALSE}
+dim(session[[1]]$spks[[1]]) 
+length(session[[1]]$brain_area)
+session[[1]]$spks[[1]][6,] # Each row contains 40 time bins. 
+```
+- How to connect the neuron spike with brain region?
+```{r,echo=FALSE}
+session[[1]]$spks[[1]][6,3] 
+session[[1]]$brain_area[6]
+```
+
+The above information tells us in session 1 trail 1, the 6 neuron (from area ACA) has a spike at time bin 3. 
+
+## Data processing 
+
+I define the "spike rate" for each neuron as the total number of spikes accumulated across the 40 time bins. The "region_mean_spike" represents the average spike rate calculated for each region. 
+
+```{r,echo=FALSE}
+get_trail_data <- function(session_id, trail_id){
+  spikes <- session[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  #trail_tibble <- as_tibble(spikes) %>% set_names(binename) %>%  add_column("brain_area" = session[[session_id]]$brain_area ) %>% group_by(brain_area) %>% summarize( "sum_spikes" =across(everything(),sum),.groups = "drop") 
+  trail_tibble <- tibble("neuron_spike" = rowSums(spikes))  %>%  add_column("brain_area" = session[[session_id]]$brain_area ) %>% group_by(brain_area) %>% summarize( region_sum_spike = sum(neuron_spike), region_count = n(),region_mean_spike = mean(neuron_spike)) 
+  trail_tibble  = trail_tibble%>% add_column("trail_id" = trail_id) %>% add_column("contrast_left"= session[[session_id]]$contrast_left[trail_id]) %>% add_column("contrast_right"= session[[session_id]]$contrast_right[trail_id]) %>% add_column("feedback_type"= session[[session_id]]$feedback_type[trail_id])
+  trail_tibble
+}
+
+```
+
+
+```{r,echo=FALSE}
+binename <- paste0("bin", as.character(1:40))
+get_trail_data <- function(session_id, trail_id){
+  spikes <- session[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trail_tibble <- as_tibble(spikes) %>% 
+    set_names(binename) %>%  
+    add_column("brain_area" = session[[session_id]]$brain_area ) %>% 
+    group_by(brain_area) %>% 
+    summarise_all(sum)
+
+  trail_tibble <- tibble("neuron_spike" = rowSums(spikes))  %>%  
+    add_column("brain_area" = session[[session_id]]$brain_area ) %>% 
+    group_by(brain_area) %>% 
+    summarise(
+      region_sum_spike = sum(neuron_spike), 
+      region_count = n(),
+      region_mean_spike = mean(neuron_spike)
+    )
+
+  trail_tibble <- trail_tibble %>% 
+    add_column("trail_id" = trail_id) %>% 
+    add_column("contrast_left"= session[[session_id]]$contrast_left[trail_id]) %>% 
+    add_column("contrast_right"= session[[session_id]]$contrast_right[trail_id]) %>% 
+    add_column("feedback_type"= session[[session_id]]$feedback_type[trail_id])
+
+  trail_tibble
+}
+
+
+
+```
+
+
+```{r,echo=FALSE}
+trail_tibble_1_2 <- get_trail_data(1,2)
+trail_tibble_1_2
+```
+
+
+
+```{r,echo=FALSE}
+get_session_data <- function(session_id){
+  n_trail <- length(session[[session_id]]$spks)
+  trail_list <- list()
+  for (trail_id in 1:n_trail){
+    trail_tibble <- get_trail_data(session_id,trail_id)
+    trail_list[[trail_id]] <- trail_tibble
+  }
+  session_tibble <- do.call(rbind, trail_list)
+  session_tibble <- session_tibble %>% add_column("mouse_name" = session[[session_id]]$mouse_name) %>% add_column("date_exp" = session[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+```
+```{r,echo=FALSE}
+session_1 <- get_session_data(1)
+head(session_1)
+```
+
+```{r,echo=FALSE}
+session_list = list()
+for (session_id in 1: 18){
+  session_list[[session_id]] <- get_session_data(session_id)
+}
+full_tibble <- do.call(rbind, session_list)
+full_tibble$success <- full_tibble$feedback_type == 1
+full_tibble$success <- as.numeric(full_tibble$success)
+full_tibble$contrast_diff <- abs(full_tibble$contrast_left-full_tibble$contrast_right)
+```
+
+In an alternative approach to data processing, for each trial, I calculate the mean number of spikes from neurons within each time bin, which I refer to as "trial_bin_average."
+
+```{r,echo=FALSE}
+binename <- paste0("bin", as.character(1:40))  #Defines the names of time bins from "bin1" to "bin40."
+
+get_trail_functional_data <- function(session_id, trail_id){
+  spikes <- session[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trail_bin_average <- matrix(colMeans(spikes), nrow = 1) #Calculating the average neuron spike for each time bin
+  colnames(trail_bin_average) <- binename
+  trail_tibble  = as_tibble(trail_bin_average)%>% add_column("trail_id" = trail_id) %>% add_column("contrast_left"= session[[session_id]]$contrast_left[trail_id]) %>% add_column("contrast_right"= session[[session_id]]$contrast_right[trail_id]) %>% add_column("feedback_type"= session[[session_id]]$feedback_type[trail_id])
+  
+  trail_tibble
+}
+get_session_functional_data <- function(session_id){
+  n_trail <- length(session[[session_id]]$spks)
+  trail_list <- list()
+  for (trail_id in 1:n_trail){
+    trail_tibble <- get_trail_functional_data(session_id,trail_id)
+    trail_list[[trail_id]] <- trail_tibble
+  }
+  session_tibble <- as_tibble(do.call(rbind, trail_list))
+  session_tibble <- session_tibble %>% add_column("mouse_name" = session[[session_id]]$mouse_name) %>% add_column("date_exp" = session[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+```
+
+
+```{r, echo = FALSE}
+session_list = list()
+for (session_id in 1: 18){
+  session_list[[session_id]] <- get_session_functional_data(session_id)
+}
+full_functional_tibble <- as_tibble(do.call(rbind, session_list))
+full_functional_tibble$session_id <- as.factor(full_functional_tibble$session_id )
+full_functional_tibble$contrast_diff <- abs(full_functional_tibble$contrast_left-full_functional_tibble$contrast_right)
+
+full_functional_tibble$success <- full_functional_tibble$feedback_type == 1
+full_functional_tibble$success <- as.numeric(full_functional_tibble$success)
+```
+
+In the following table, each row contains information of a particular trail. The columns contains the average spike rate for each time bin.
+
+```{r,echo=FALSE}
+head(full_functional_tibble)
+```
+
+
+# Section 2 Exploratory analysis.
+
+## What is different for each session/mouse
+
+```{r,echo=FALSE}
+full_tibble %>%  group_by(session_id, mouse_name) %>% 
+  summarise(unique_neurons = n_distinct(brain_area))
+
+```
+
+
+```{r,echo=FALSE}
+# Counting unique neurons for each combination of session_id and mouse_name
+unique_neurons_counts <- full_tibble %>%  
+  group_by(session_id, mouse_name) %>% 
+  summarise(unique_neurons = n_distinct(brain_area))
+
+# Creating a bar plot for better visualization
+ggplot(unique_neurons_counts, aes(x = mouse_name, y = unique_neurons, fill = as.factor(session_id))) +
+  geom_col(position = "dodge", width = 0.7) +
+  labs(x = "Mouse Name", y = "Number of Unique Neurons", title = "Unique Neurons in Each Mouse by Session") +
+  #scale_fill_brewer(palette = "Set3", limits = unique_neurons_counts$session_id) +  # Choose a color palette
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))  # Rotate x-axis labels
+
+```
+
+The plot illustrates the number of unique neurons recorded in each mouse for different sessions. Each colored bar represents a session, and the height of the bars indicates the count of distinct brain areas (neurons) in a particular mouse during that session. we can observe how the number of recorded neurons varies across different sessions for each mouse. The use of different colors for each session enhances the clarity of the representation, allowing for an easy comparison of unique neuron counts between mice and sessions.
+
+### What are the number of neuron's in each session?
+```{r,echo=FALSE}
+full_tibble %>% 
+  filter(trail_id == 1) %>% 
+  group_by(session_id) %>% 
+  summarise(total_neurons = sum(region_count)) %>% 
+  ggplot(aes(x = session_id, y = total_neurons, fill = factor(session_id))) +
+  geom_bar(stat = "identity") +
+  labs(x = "Session ID", y = "Total Neurons", title = "Number of Neurons in Each Session") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+```
+
+
+### What is the number brain area of each session
+```{r,echo=FALSE}
+# Count the number of unique brain areas per session
+unique_area_counts <- full_tibble %>%
+  group_by(session_id) %>%
+  summarise(unique_area = n_distinct(brain_area))
+
+# Use a color-filled bar plot for better visualization
+ggplot(unique_area_counts, aes(x = session_id, y = unique_area, fill = as.factor(session_id))) +
+  geom_col() +
+  labs(x = "Session ID", y = "Number of Unique Brain Areas",title = "Number of  unique brain area of each session")  +
+  #scale_fill_brewer(palette = "Set3", limits = unique_area_counts$session_id) +  
+  theme_bw() +
+  theme(axis.text.x = element_text(vjust = 1, hjust = 1))  # Rotate x-axis labels
+
+
+```
+
+### What is the average spike rate over each session 
+```{r,echo=FALSE}
+# Calculate average spike rate per session
+average_spike <- full_tibble %>%
+  group_by(session_id, trail_id) %>%
+  mutate(mean_spike = sum(region_sum_spike) / sum(region_count)) %>%
+  group_by(session_id) %>%
+  summarise(mean_session_spike = mean(mean_spike))
+
+# Plot the average spike rate concisely
+ggplot(average_spike, aes(x = session_id, y = mean_session_spike)) +
+  geom_point(color = "coral2") +
+  geom_line(color = "coral2", linetype = "dashed") +
+  
+  labs(x = "Session ID", y = "Average Spike Rate",title = "average spike rate over each session ") +
+  theme_bw()
+```
+
+This plot depicts the average spike rate per session. The x-axis represents different sessions, while the y-axis represents the average spike rate of neurons in each session. Each point represents the average spike rate of a session, and the dashed line reflects the trend among these points. The purpose of this plot is to illustrate the distribution of neuron spike rates across different sessions, aiding in the analysis of patterns and trends in the data. The third session and the thirteen session have the highest two average spike rates.
+
+### What are the brain areas with neurons recorded in each session?
+
+
+```{r,echo=FALSE}
+# Using the count function to get the number of occurrences for each brain area in each session
+brain_area_counts <- full_tibble %>%
+  group_by(session_id, brain_area) %>%
+  count()
+
+# Plotting the updated version with counts
+ggplot(brain_area_counts, aes(x = session_id, y = brain_area, size = n)) +
+  geom_point(alpha = 0.5, color = "skyblue") +
+  labs(x = "Session ID", y = "Brain Area", size = "Count") +
+  theme_bw() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+```
+
+
+
+### Estimate success rate over different groups (session and mouse)
+
+```{r,echo=FALSE}
+full_functional_tibble %>% 
+  group_by(session_id) %>% 
+  dplyr::summarize(success_rate = mean(success, na.rm = TRUE))
+
+```
+```{r,echo=FALSE}
+full_functional_tibble %>% 
+  group_by(mouse_name) %>% 
+  dplyr::summarize(success_rate = mean(success, na.rm = TRUE))
+```
+```{r,echo=FALSE}
+## Plotting success rates for different mice with a more visually appealing theme
+ggplot(full_functional_tibble, aes(x = mouse_name, y = success, fill = mouse_name)) +
+  geom_bar(stat = "summary", fun = "mean", position = "dodge", color = "black", show.legend = FALSE, width = 0.7, alpha = 0.9) +
+  labs(x = "Mouse Name", y = "Success Rate", title = "Success Rate by Mouse") +
+  theme_bw() +
+  theme(axis.text.x = element_text( hjust = 1),
+        panel.grid = element_blank(),
+        axis.line = element_line(color = "black"))
+
+```
+
+
+```{r,echo=FALSE}
+# Tukey's test for pairwise comparison of success rates between mice
+tukey_test <- TukeyHSD(aov(success ~ mouse_name, data = full_functional_tibble))
+
+# Extract the p-values
+tukey_pvalues <- tukey_test$`mouse_name`[, "p adj"]
+
+# Create a dataframe for plotting
+tukey_df <- data.frame(group1 = rep(names(tukey_pvalues), each = length(tukey_pvalues)),
+                       group2 = rep(names(tukey_pvalues), length(tukey_pvalues)),
+                       p_value = tukey_pvalues)
+
+# Remove self-comparisons
+tukey_df <- tukey_df[tukey_df$group1 != tukey_df$group2, ]
+
+# Plotting the pairwise comparisons
+ggplot(tukey_df, aes(x = group1, y = group2, fill = p_value < 0.05)) +
+  geom_tile(color = "white") +
+  scale_fill_manual(values = c("TRUE" = "skyblue", "FALSE" = "white")) +
+  labs(x = "Mouse Name 1", y = "Mouse Name 2", title = "Tukey's HSD: Pairwise Comparison of Success Rates") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank(),
+        axis.line = element_line(color = "black"))
+
+```
+
+This plot uses Tukey's Honest Significant Difference (HSD) test to compare success rates between mice. Each tile represents a pairwise comparison, and blue tiles indicate significant differences (p-value < 0.05).
+
+
+
+## What is different among each trail?
+
+### What is the contrast difference distribution?
+```{r,echo=FALSE}
+full_functional_tibble %>% group_by(contrast_diff) %>% count() %>% 
+  ungroup() %>% 
+  mutate(perc = `n` / sum(`n`)) %>% 
+  arrange(perc) %>%
+  mutate(labels = scales::percent(perc))
+```
+
+### How does the contrast difference affect the success rate?
+```{r,echo=FALSE}
+full_functional_tibble %>% 
+  group_by(contrast_diff) %>% 
+  dplyr::summarize(success_rate = mean(success, na.rm = TRUE))
+```
+
+
+### Does the success rate difference among mice caused by the different distributions of contrast difference? 
+
+```{r,echo=FALSE}
+counts_df <- full_functional_tibble[c('mouse_name', 'contrast_diff')]
+counts_df$contrast_diff <- as.factor(counts_df$contrast_diff)
+counts <- table(counts_df)
+
+percentages <- prop.table(counts, margin = 1)
+percentages
+
+```
+
+### Can you use two-way ANOVA to answer the above question more rigorously? 
+
+```{r,echo=FALSE}
+# 'mouse_name' and 'contrast_diff' are the categorical predictor variables
+model <- aov(success ~ mouse_name * contrast_diff, data = full_functional_tibble)
+summary(model)
+
+```
+- Mouse Name Effect: The factor 'mouse_name' has a significant effect on success rates (p-value < 0.001).
+The F-statistic of 16.33 suggests that there are significant differences in success rates between at least some pairs of mice.
+
+
+- Contrast Difference Effect:The factor 'contrast_diff' also has a highly significant effect on success rates (p-value < 2e-16). The F-statistic of 105.39 indicates that different contrast differences lead to significantly different success rates.
+
+
+- Interaction Effect:The interaction between 'mouse_name' and 'contrast_diff' is statistically significant (p-value < 0.001). This suggests that the effect of contrast difference on success rates may vary across different mice, and vice versa.
+
+
+
+### Visualize success rate change over time (trail)
+
+The success rate is binned for each 25 trails.
+```{r,echo=FALSE}
+full_functional_tibble$trail_group = cut(full_functional_tibble$trail_id, breaks = seq(0, max(full_functional_tibble$trail_id), by = 25),include.lowest = TRUE)
+levels(full_functional_tibble$trail_group) <- seq(0, max(full_functional_tibble$trail_id), by = 25)[2:18]
+```
+
+The success rate change over time for individual sessions:
+
+
+```{r,echo=FALSE}
+# Create a more precise and visually appealing plot
+success_rate <- aggregate(success ~ session_id + trail_group, data = full_functional_tibble, FUN = function(x) mean(x) )
+ggplot(success_rate, aes(x = as.numeric(trail_group), y = success)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "skyblue", color = "black") +
+  facet_wrap(~session_id, ncol = 3) +
+  labs(x = "Trail Group", y = "Success Rate", title = "Success Rate Change Over Time for Individual Sessions") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.line = element_line(color = "black"),
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 8),
+        strip.background = element_rect(fill = "lightgray", color = "white"))
+
+```
+
+
+The success rate change over time for individual mouse:
+
+```{r,echo=FALSE}
+success_rate <- aggregate(success ~ mouse_name + trail_group, data = full_functional_tibble, FUN = function(x) mean(x) )
+
+# Create a more precise and visually appealing plot for mouse-specific success rate change over time
+ggplot(success_rate, aes(x = as.numeric(trail_group), y = success)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "skyblue", color = "black") +
+  facet_wrap(~mouse_name) +
+  labs(x = "Trail Group", y = "Success Rate", title = "Mouse-Specific Success Rate Change Over Time") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.line = element_line(color = "black"),
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 8),
+        strip.background = element_rect(fill = "lightgray", color = "white"))
+
+```
+
+
+### Visualize the change of overall neuron spike rate over time
+
+The ``average_spike`` is the number of spikes within each number bin divided total number of neurons for each trail.
+
+```{r,echo=FALSE}
+col_names <-names(full_functional_tibble)
+region_sum_subset <- col_names[grep("^region_sum", col_names)]
+region_mean_subset <- col_names[grep("^region_mean", col_names)]
+
+```
+```{r,echo=FALSE}
+# average_spike <- full_tibble %>% group_by( session_id,trail_id) %>% summarise(mean_spike = mean(region_mean_spike))
+average_spike <- full_tibble %>% group_by( session_id,trail_id) %>% summarise(mean_spike = sum(region_sum_spike)/sum(region_count))
+
+average_spike$mouse_name <- full_functional_tibble$mouse_name
+average_spike$contrast_diff <- full_functional_tibble$contrast_diff
+average_spike$success <- full_functional_tibble$success
+```
+
+```{r}
+# Create a line plot to visualize the change in overall neuron spike rate over time
+ggplot(average_spike, aes(x = trail_id, y = mean_spike, group = session_id, color = factor(contrast_diff))) +
+  geom_line(size = 1) +
+  geom_point(size = 2, aes(shape = factor(contrast_diff))) +
+  facet_wrap(~mouse_name, scales = "free") +
+  labs(x = "Trail ID", y = "Average Spike Rate", title = "Change in Overall Neuron Spike Rate Over Time") +
+  theme_bw() +
+  theme(legend.position = "top",
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 8),
+        strip.background = element_rect(fill = "lightgray", color = "white"))
+
+```
+
+
+The change of overall neuron spike rate for each session 
+
+```{r,echo=FALSE}
+ggplot(average_spike, aes(x = trail_id, y = mean_spike)) + 
+  geom_line()+
+  geom_smooth(method = "loess")+  # Fit a smooth spline
+  facet_wrap(~session_id)+
+  theme_bw()
+```
+
+
+The line plot illustrates the change in the overall neuron spike rate for each session across different trails. Each line corresponds to a different session, showing how the average spike rate evolves over the course of the experimental trials. The lines help visualize the trajectory of neural activity trends within each session.The smoothed curve, generated using the loess method, provides a more generalized view of the trends by reducing noise.
+
+
+The change of overall neuron spike rate for each mouse 
+
+```{r,echo=FALSE}
+ggplot(average_spike, aes(x = trail_id, y = mean_spike)) + 
+  geom_line()+
+  geom_smooth(method = "loess")+  # Fit a smooth spline
+  facet_wrap(~mouse_name)+
+  theme_bw()
+```
+
+
+PCA
+
+We perform Dimension Reduction through PCA
+
+```{r, echo = FALSE}
+features = full_functional_tibble[,1:40]
+scaled_features <- scale(features)
+pca_result <- prcomp(scaled_features)
+pc_df <- as.data.frame(pca_result$x)
+pc_df$session_id <- full_functional_tibble$session_id
+pc_df$mouse_name <- full_functional_tibble$mouse_name
+```
+
+The dots are colored for different session. 
+
+```{r, echo = FALSE}
+ggplot(pc_df, aes(x = PC1, y = PC2, color = session_id)) +
+  geom_point() +
+  labs(title = "PCA: PC1 vs PC2")+
+  theme_bw()
+```
+
+The dots are colored for different mouse 
+```{r, echo = FALSE}
+ggplot(pc_df, aes(x = PC1, y = PC2, color = mouse_name)) +
+  geom_point() +
+  labs(title = "PCA: PC1 vs PC2")+
+  theme_bw()
+```
+
+In the  first scatter plot, which are the colored by different session, we can see that the cluster by sessions could be considerable as overlap between each sessions. In the second scatter plot, which colored by different mouse name, we can see that the clustering appears more distinct than the first scatter plot. This may indicate that individual differences between mice may be more obvious than session to session differences. However, both plots does not contain a clear, completely separate clustering. 
+
+
+
+# Section 3 Data integration
+This section is an outlines of the preparatory steps for a predictive analysis using trials from all sessions. We aim to gauge the model's overall performance by employing features session_id, trail_id, signals, and the average spike rate of each time bin. We create a dataset that contain these features and make sure it is ready for predictive modeling in the following.
+
+
+```{r}
+predictive_feature <- c("session_id","trail_id","contrast_right","contrast_left", "contrast_diff" ,binename)
+head(full_functional_tibble[predictive_feature])
+```
+
+```{r,echo=FALSE}
+predictive_dat <- full_functional_tibble[predictive_feature]
+predictive_dat$trail_id <- as.numeric(predictive_dat$trail_id)
+label <- as.numeric(full_functional_tibble$success)
+X <- model.matrix(~., predictive_dat)
+```
+
+# Section 4 Predictive modeling
+
+## train the model on 80% trails and test it on the rest 
+
+```{r,echo=FALSE}
+# split
+set.seed(2333) # for reproducibility
+trainIndex <- createDataPartition(label, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train_df <- predictive_dat[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_dat[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+```
+
+```{r,echo=FALSE}
+# Modeling packages
+library(ranger)   # a c++ implementation of random forest 
+library(e1071)
+```
+
+
+(1) xgboost
+
+```{r,echo=FALSE}
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+```
+
+```{r,echo=FALSE}
+xgb_predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(xgb_predictions> 0.5, 1, 0))
+xgb_accuracy <- mean(predicted_labels == test_label)
+xgb_accuracy
+```
+```{r,echo=FALSE}
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+conf_matrix$table
+```
+
+
+(2) random forest classifier
+
+```{r,echo=FALSE}
+train_label <- as.factor(train_label)
+test_label <- as.factor(test_label)
+
+train_df$success <- train_label
+test_df$success <- test_label
+```
+
+ 
+```{r,echo=FALSE}
+# number of features
+n_features <- length(setdiff(names(train_df), "success"))
+
+# train a default random forest model
+rf_model <- ranger(
+  success ~ ., 
+  data = train_df,
+  mtry = floor(sqrt(n_features)),
+  num.trees = 500,
+  importance = "impurity",
+  seed = 123
+)
+rf_model
+```
+
+The model is designed for classification tasks, employing a forest of 500 trees. With a sample size of 4065 observations and 45 independent variables, the model is trained with a subset of six random features considered at each split node in each tree. 
+The target node size specifies the minimum number of samples in each leaf node of the tree. Variable importance is measured based on impurity, and the split rule is determined using the Gini index. The out-of-bag (OOB) prediction error, a measure of prediction accuracy on unseen data, is reported at 27.08%, suggesting that the model achieves an accuracy of approximately 72.92% on samples not included in the training set.
+
+
+```{r,echo=FALSE}
+rf_predictions <- predict(rf_model, data=test_df)
+rf_predictions<-rf_predictions$predictions
+```
+
+
+```{r,echo=FALSE}
+# Confusion Matrix
+rf_conf_matrix <- confusionMatrix(rf_predictions, test_label)
+rf_conf_matrix$table
+
+# AUROC
+library(pROC)
+roc_obj <- roc(as.numeric(test_df$success), as.numeric(rf_predictions))
+auc <- auc(roc_obj)
+cat("AUROC:", auc, "\n")
+```
+
+```{r,echo=FALSE}
+# Extract confusion matrix
+conf_mat <- rf_conf_matrix$table
+
+# Calculate accuracy
+accuracy <- sum(diag(conf_mat)) / sum(conf_mat)
+
+# Calculate precision
+precision <- conf_mat[2, 2] / sum(conf_mat[, 2])
+
+# Calculate recall
+recall <- conf_mat[2, 2] / sum(conf_mat[2, ])
+
+# Calculate F1-score
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+# Display results
+cat("accuracy:", accuracy, "\n")
+cat("precision:", precision, "\n")
+cat("recall:", recall, "\n")
+cat("f1_score:", f1_score, "\n")
+```
+
+- Accuracy: The model achieved an accuracy of approximately 73.72%, indicating that about 73.72% of the predictions made by the model were correct.
+
+
+- Precision: The precision, which measures the proportion of true positive predictions among all positive predictions made by the model, was approximately 98.08%. This high precision suggests that when the model predicts a positive outcome, it is correct around 98.08% of the time.
+
+
+- Recall: The recall, also known as sensitivity, measures the proportion of actual positive instances that the model correctly identifies. In this case, the recall was approximately 73.84%, indicating that the model correctly identified around 73.84% of the actual positive instances.
+
+
+- F1-score: The F1-score, which is the harmonic mean of precision and recall, provides a balance between precision and recall. The F1-score achieved by the model was approximately 84.25%, indicating a good balance between precision and recall.
+
+
+Overall, these metrics suggest that the random forest model performed reasonably well on the testing set, with high precision and a balanced trade-off between precision and recall.
+
+(3) svm classifier
+
+```{r,echo=FALSE}
+library(kernlab)
+# specifying the CV tech nique which will be passed into the train() function later and number parameter is the "k" in K-fold cross validation
+train_control = trainControl(method = "cv", number = 10)
+
+# training a Regression model while tuning parameters (Method = "rpart")
+svm_model = train(success~., data = train_df, method = "svmLinear", trControl = train_control)
+
+# summarising the results
+print(svm_model)
+
+```
+
+```{r,echo=FALSE}
+#use model to make predictions on test data
+svm_pred = predict(svm_model, test_df)
+
+# confusion Matrix
+confusionMatrix(data = svm_pred, test_df$success)
+```
+
+# Section 5 Prediction performance on the test sets
+
+```{r}
+session=list()
+for(i in 1:2){
+  session[[i]]=readRDS(paste('./test/test',i,'.rds',sep=''))
+  print(session[[i]]$mouse_name)
+  print(session[[i]]$date_exp)
+}
+```
+
+```{r,echo=FALSE}
+# names(session[[1]])
+```
+```{r,echo=FALSE}
+get_trail_data <- function(session_id, trail_id){
+  spikes <- session[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trail_tibble <- tibble("neuron_spike" = rowSums(spikes))  %>%  add_column("brain_area" = session[[session_id]]$brain_area ) %>% group_by(brain_area) %>% summarize( region_sum_spike = sum(neuron_spike), region_count = n(),region_mean_spike = mean(neuron_spike)) 
+  trail_tibble  = trail_tibble%>% add_column("trail_id" = trail_id) %>% add_column("contrast_left"= session[[session_id]]$contrast_left[trail_id]) %>% add_column("contrast_right"= session[[session_id]]$contrast_right[trail_id]) %>% add_column("feedback_type"= session[[session_id]]$feedback_type[trail_id])
+  trail_tibble
+}
+```
+
+
+```{r,echo=FALSE}
+binename <- paste0("bin", as.character(1:40))
+get_trail_data <- function(session_id, trail_id){
+  spikes <- session[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trail_tibble <- as_tibble(spikes) %>% 
+    set_names(binename) %>%  
+    add_column("brain_area" = session[[session_id]]$brain_area ) %>% 
+    group_by(brain_area) %>% 
+    summarise_all(sum)
+
+  trail_tibble <- tibble("neuron_spike" = rowSums(spikes))  %>%  
+    add_column("brain_area" = session[[session_id]]$brain_area ) %>% 
+    group_by(brain_area) %>% 
+    summarise(
+      region_sum_spike = sum(neuron_spike), 
+      region_count = n(),
+      region_mean_spike = mean(neuron_spike)
+    )
+
+  trail_tibble <- trail_tibble %>% 
+    add_column("trail_id" = trail_id) %>% 
+    add_column("contrast_left"= session[[session_id]]$contrast_left[trail_id]) %>% 
+    add_column("contrast_right"= session[[session_id]]$contrast_right[trail_id]) %>% 
+    add_column("feedback_type"= session[[session_id]]$feedback_type[trail_id])
+
+  trail_tibble
+}
+```
+
+
+```{r,echo=FALSE}
+# trail_tibble_1_2 <- get_trail_data(1,2)
+# trail_tibble_1_2
+```
+
+
+```{r,echo=FALSE}
+get_session_data <- function(session_id){
+  n_trail <- length(session[[session_id]]$spks)
+  trail_list <- list()
+  for (trail_id in 1:n_trail){
+    trail_tibble <- get_trail_data(session_id,trail_id)
+    trail_list[[trail_id]] <- trail_tibble
+  }
+  session_tibble <- do.call(rbind, trail_list)
+  session_tibble <- session_tibble %>% add_column("mouse_name" = session[[session_id]]$mouse_name) %>% add_column("date_exp" = session[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+```
+```{r,echo=FALSE}
+# session_1 <- get_session_data(1)
+# head(session_1)
+```
+
+```{r,echo=FALSE}
+session_list = list()
+for (session_id in 1: 2){
+  session_list[[session_id]] <- get_session_data(session_id)
+}
+full_tibble <- do.call(rbind, session_list)
+full_tibble$success <- full_tibble$feedback_type == 1
+full_tibble$success <- as.numeric(full_tibble$success)
+full_tibble$contrast_diff <- abs(full_tibble$contrast_left-full_tibble$contrast_right)
+```
+
+
+
+```{r,echo=FALSE}
+binename <- paste0("bin", as.character(1:40))  #Defines the names of time bins from "bin1" to "bin40."
+
+get_trail_functional_data <- function(session_id, trail_id){
+  spikes <- session[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trail_bin_average <- matrix(colMeans(spikes), nrow = 1) #Calculating the average neuron spike for each time bin
+  colnames(trail_bin_average) <- binename
+  trail_tibble  = as_tibble(trail_bin_average)%>% add_column("trail_id" = trail_id) %>% add_column("contrast_left"= session[[session_id]]$contrast_left[trail_id]) %>% add_column("contrast_right"= session[[session_id]]$contrast_right[trail_id]) %>% add_column("feedback_type"= session[[session_id]]$feedback_type[trail_id])
+  
+  trail_tibble
+}
+get_session_functional_data <- function(session_id){
+  n_trail <- length(session[[session_id]]$spks)
+  trail_list <- list()
+  for (trail_id in 1:n_trail){
+    trail_tibble <- get_trail_functional_data(session_id,trail_id)
+    trail_list[[trail_id]] <- trail_tibble
+  }
+  session_tibble <- as_tibble(do.call(rbind, trail_list))
+  session_tibble <- session_tibble %>% add_column("mouse_name" = session[[session_id]]$mouse_name) %>% add_column("date_exp" = session[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+```
+
+
+```{r, echo = FALSE}
+session_list = list()
+for (session_id in 1: 2){
+  session_list[[session_id]] <- get_session_functional_data(session_id)
+}
+full_functional_tibble <- as_tibble(do.call(rbind, session_list))
+full_functional_tibble$session_id <- as.factor(full_functional_tibble$session_id )
+full_functional_tibble$contrast_diff <- abs(full_functional_tibble$contrast_left-full_functional_tibble$contrast_right)
+
+full_functional_tibble$success <- full_functional_tibble$feedback_type == 1
+full_functional_tibble$success <- as.numeric(full_functional_tibble$success)
+```
+
+
+
+## test the model's performance on 100 random trails from session 1
+```{r,echo=FALSE}
+# split
+set.seed(123) # for reproducibility
+session_1_row <- which(full_functional_tibble$session_id==1)
+testIndex <- sample(session_1_row, 100, replace = FALSE)
+trainIndex <- 1:nrow(full_functional_tibble)
+trainIndex <- trainIndex[!(trainIndex %in% testIndex)]
+
+train_df <- predictive_dat[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_dat[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+```
+
+Prediction results (accuracy, confusion matrix, AUROC)
+
+- xgboost 
+```{r,echo=FALSE}
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+accuracy
+
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+conf_matrix$table
+auroc <- roc(test_label, predictions)
+auroc
+```
+
+
+- random forest classifier
+```{r,echo=FALSE}
+train_label <- as.factor(train_label)
+test_label <- as.factor(test_label)
+
+train_df$success <- train_label
+test_df$success <- test_label
+```
+
+
+```{r,echo=FALSE}
+rf_predictions <- predict(rf_model, data=test_df)
+rf_predictions<-rf_predictions$predictions
+```
+
+
+```{r,echo=FALSE}
+# Confusion Matrix
+rf_conf_matrix <- confusionMatrix(rf_predictions, test_label)
+rf_conf_matrix$table
+
+# AUROC
+roc_obj <- roc(as.numeric(test_df$success), as.numeric(rf_predictions))
+auc <- auc(roc_obj)
+cat("AUROC:", auc, "\n")
+```
+
+
+```{r,echo=FALSE}
+# Extract confusion matrix
+conf_mat <- rf_conf_matrix$table
+
+# Calculate accuracy
+accuracy <- sum(diag(conf_mat)) / sum(conf_mat)
+
+# Calculate precision
+precision <- conf_mat[2, 2] / sum(conf_mat[, 2])
+
+# Calculate recall
+recall <- conf_mat[2, 2] / sum(conf_mat[2, ])
+
+# Calculate F1-score
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+# Display results
+cat("accuracy:", accuracy, "\n")
+cat("precision:", precision, "\n")
+cat("recall:", recall, "\n")
+cat("f1_score:", f1_score, "\n")
+
+```
+
+- svm classifier
+```{r,echo=FALSE}
+#use model to make predictions on test data
+svm_pred = predict(svm_model, test_df)
+
+# confusion Matrix
+confusionMatrix(data = svm_pred, test_df$success)
+```
+
+
+## test the model's performance on 100 random trails from session 18 
+```{r,echo=FALSE}
+# split
+set.seed(2333) # for reproducibility
+session_18_row <- which(full_functional_tibble$session_id==2)
+testIndex <- sample(session_18_row, 100, replace = FALSE)
+trainIndex <- 1:nrow(full_functional_tibble)
+trainIndex <- trainIndex[!(trainIndex %in% testIndex)]
+
+train_df <- predictive_dat[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_dat[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+```
+
+
+Prediction results (accuracy, confusion matrix, AUROC)
+
+- xgboost
+```{r,echo=FALSE}
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+accuracy
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+conf_matrix$table
+auroc <- roc(test_label, predictions)
+auroc
+```
+
+- random forest classifier
+```{r,echo=FALSE}
+train_label <- as.factor(train_label)
+test_label <- as.factor(test_label)
+
+train_df$success <- train_label
+test_df$success <- test_label
+```
+
+
+```{r,echo=FALSE}
+rf_predictions <- predict(rf_model, data=test_df)
+rf_predictions<-rf_predictions$predictions
+```
+
+
+```{r,echo=FALSE}
+# Confusion Matrix
+rf_conf_matrix <- confusionMatrix(rf_predictions, test_label)
+rf_conf_matrix$table
+
+# AUROC
+
+roc_obj <- roc(as.numeric(test_df$success), as.numeric(rf_predictions))
+auc <- auc(roc_obj)
+cat("AUROC:", auc, "\n")
+```
+
+
+```{r}
+# Extract confusion matrix
+conf_mat <- rf_conf_matrix$table
+
+# Calculate accuracy
+accuracy <- sum(diag(conf_mat)) / sum(conf_mat)
+
+# Calculate precision
+precision <- conf_mat[2, 2] / sum(conf_mat[, 2])
+
+# Calculate recall
+recall <- conf_mat[2, 2] / sum(conf_mat[2, ])
+
+# Calculate F1-score
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+# Display results
+cat("accuracy:", accuracy, "\n")
+cat("precision:", precision, "\n")
+cat("recall:", recall, "\n")
+cat("f1_score:", f1_score, "\n")
+
+```
+
+- svm classifier
+```{r}
+#use model to make predictions on test data
+svm_pred = predict(svm_model, test_df)
+
+# confusion Matrix
+confusionMatrix(data = svm_pred, test_df$success)
+```
+
+The performance of three machine learning models, namely XGBoost, random forest and SVM, was evaluated on 100 random trials from session 1 and session 18 in a neuroscience experiment. 
+
+For session 1, random forest achieved the highest accuracy of 94.68%, with precision, recall, and F1-score values of approximately 99.60%, 93.35%, and 96.38%, respectively. SVM exhibited an accuracy of 71.07%, which was significantly lower than random forest, but still performed better than the no information rate. XGBoost, however, demonstrated the lowest accuracy at 49.70%, indicating poor performance in classifying trial outcomes. 
+
+Similarly, for session 18, random forest yielded an accuracy of 94.76% with high precision, recall, and F1-score values of approximately 99.60%, 93.46%, 96.43%, respectively. SVM maintained the almost the same accuracy as in session 1, which is 71.11%. While XGBoost showed a slight improvement in accuracy to 60.07%. 
+
+In summary, random forest consistently outperformed SVM and XGBoost in both sessions, achieving the highest accuracy and robust performance across precision, recall, and F1-score metrics.However, even with high precision, recall, and F1-scores, it is possible for a model to overfit in both sessions. SVM showed moderate performance, while XGBoost exhibited relatively poor classification accuracy compared to the other models. These results emphasize the effectiveness of random forest in classifying trial outcomes in neuroscience experiments and suggest its suitability for similar classification tasks in this domain.
+
+# Section 6 Discussion
+
+The analysis conducted in this project delved into neuronal activity data collected from mice engaged in visual discrimination tasks. The dataset encompassed spike rates of neurons across various brain regions, alongside experimental conditions such as contrast levels and feedback outcomes. Our objective centered on predicting the outcomes of random trials from session 1 and session 18 using this dataset.
+
+During the exploratory analysis, we discerned patterns in neuronal activity across sessions, brain regions, and experimental conditions. We examined the distribution of recorded neurons in each session, unveiling disparities in spike rates over time. Additionally, we scrutinized the success rate of trials across different mice and contrast difference levels.
+
+For the predictive modeling task, we deployed machine learning algorithms, including XGBoost, random forest, and support vector machine (SVM). After training these models on a subset of the data, we evaluated their performance on 100 random trials from session 1 and session 18 from the test data. The outcomes showcased random forest as the frontrunner with the highest accuracy for both (0.94), trailed by SVM (0.71) and XGBoost (session 1: 0.49, session 18: 0.60). Furthermore, precision, recall, and F1-score metrics were computed for random forest, revealing exceptional performance in terms of positive predictive value and sensitivity. However, there is also a possible to overfit with such a high accuracy in random forest classifier. 
+
+In summary, the machine learning models demonstrated considerable promise in predicting trial outcomes based on neuronal activity data. Notably, random forest emerged as the top-performing model, boasting near-perfect accuracy and commendable precision and recall. These findings underscore the significance of neuronal activity patterns in predicting experimental outcomes in visual discrimination tasks.
+
+In conclusion, this project offers valuable insights into the intricate interplay between neuronal activity and behavioral outcomes in mice. Moreover, it highlights the potential efficacy of machine learning techniques in analyzing complex neural datasets. Future research endeavors may explore additional features and modeling strategies to enhance prediction accuracy and gain deeper insights into the mechanisms underlying visual perception and decision-making.
+
+# Reference {-}
+
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
+
+Breiman, Leo. 2001. “Random Forests.” Machine Learning 45 (1). Springer: 5–32.
+
+Dı'az-Uriarte, Ramón, and Sara Alvarez De Andres. 2006. “Gene Selection and Classification of Microarray Data Using Random Forest.” BMC Bioinformatics 7 (1). BioMed Central: 3.
+
